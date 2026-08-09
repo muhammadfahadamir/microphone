@@ -30,14 +30,10 @@ gemini_model = genai.GenerativeModel(
 # WHISPER
 # ============================================================
 
-# small = better multilingual accuracy
-# tiny   = faster but less accurate
-#
-# Keep "small" for now because your speech contains
-# Urdu/Hindi/Punjabi/English.
 
+#you can change this to small or tiny if the processor is not good 
 whisper_model = WhisperModel(
-    "small",
+    "medium",
     device="cpu",
     compute_type="int8",
 )

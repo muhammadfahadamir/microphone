@@ -1,250 +1,90 @@
-# Step-by-Step Guide: Build, Run, and Submit This Project
-### (Free stack: local Whisper for transcription + Google Gemini for summary)
+# Real-Time Speech Transcription and Meeting Summarization
 
-Follow these in order. Don't skip steps even if they seem obvious.
+## Setup and run (clean machine)
 
----
+1. Install Python 3.10+.
+2. `cd backend`
+3. `python -m venv venv && source venv/bin/activate` (Windows: `venv\Scripts\activate`)
+4. `pip install -r requirements.txt`
+5. `cp .env.example .env` and put your real Gemini API key in `.env`
+6. `uvicorn server:app --reload --port 8000`
+7. Open `frontend/index.html` directly in Chrome (double-click the file, or serve it
+   with `python -m http.server 5500` from the `frontend/` folder and visit
+   `http://localhost:5500`). Allow microphone access when prompted.
+8. Click **Start Session**, speak (mix Urdu/Hindi/Punjabi/English freely), click
+   **End Session** when done.
 
-## STEP 1 — Install Python
+## Architecture: how audio flows from mic to final output
 
-1. Go to python.org/downloads and download Python 3.11 (any 3.10+ works).
-2. Run the installer.
-   - **Windows:** tick "Add python.exe to PATH" before clicking Install.
-   - **Mac:** run the installer normally.
-3. Verify it worked. Open a terminal (Windows: Win key → type `cmd` → Enter.
-   Mac: Cmd+Space → type `terminal` → Enter) and run:
-   ```
-   python --version
-   ```
-   You should see `Python 3.1x.x`. If Windows gives an error, close and reopen
-   the terminal and try again.
+1. **Browser** requests mic access via `getUserMedia`. Three permission states
+   (pending / granted / denied) are shown explicitly; a denial disables recording
+   but leaves the rest of the page usable.
+2. On **Start**, the browser opens a WebSocket to the backend and begins recording
+   with `MediaRecorder`. Instead of one continuous stream, the recorder is
+   **restarted every few seconds**, so each blob it produces is a complete,
+   independently-decodable `.webm/opus` file (a single MediaRecorder stream only
+   has valid headers on its first chunk — later chunks alone aren't decodable by
+   Whisper, so restarting sidesteps that).
+3. Each blob is sent as **binary data over the WebSocket** to the FastAPI backend.
+4. The backend writes the chunk to a temp file and transcribes it locally with
+   **faster-whisper** ("small" model), with no forced `language` parameter, so it
+   can auto-detect and follow language switches within the session.
+5. The transcribed text for that chunk is pushed back to the browser immediately
+   as a `partial` WebSocket message and appended to the on-screen transcript live.
+6. On **End Session**, the browser sends an `end_session` control message along
+   with the full transcript it has accumulated client-side (this matters — see
+   the reconnection note below). The backend sends that transcript to **Google
+   Gemini** (`gemini-3.6-flash`) with an explicit instruction to summarize in
+   English regardless of the source language(s), and returns the summary as a
+   `final` message. Transcript and summary render on the same page, no reload.
+7. If the WebSocket drops mid-session, the frontend detects `onclose` and
+   auto-reconnects, retrying up to 5 times with a visible attempt counter before
+   giving up. On successful reconnect it resumes sending new audio chunks.
 
----
+## Key decisions and tradeoffs
 
-## STEP 2 — Get a free Gemini API key (no card needed)
+- **Server-side transcription (Option B) over browser-side (Option A):** the
+  browser's built-in Web Speech API is unreliable for Urdu/Hindi/Punjabi and
+  essentially unusable for mid-sentence code-switching, which this project
+  requires. Whisper-family models handle mixed-language, real-world speech
+  far better.
+- **Local faster-whisper instead of a cloud transcription API:** this avoids
+  any per-request API cost and works fully offline after the model is
+  downloaded once, at the cost of slower transcription on a normal laptop CPU
+  compared to a cloud service.
+- **Chunked restart recording instead of one continuous stream:** Whisper
+  needs complete audio files, not a raw ongoing stream. Restarting the
+  recorder is the simplest way to get complete files while staying close to
+  real time. The cost: a word can occasionally be split across a chunk
+  boundary, which slightly hurts word-level accuracy right at those boundaries.
+- **Google Gemini (gemini-3.6-flash) for summarization:** free tier with no
+  billing required, fast, and good enough at instruction-following
+  ("summarize in English no matter the input language") for a session-length
+  transcript.
+- **Client-side transcript as the source of truth for summarization:** the
+  backend's own per-connection transcript memory resets on every reconnect,
+  so relying on it after a mid-session reconnect would silently drop earlier
+  content from the summary. The browser sends its full accumulated transcript
+  along with `end_session` specifically to avoid this.
+- **No forced `language` param on Whisper:** letting it auto-detect per chunk
+  handles language switching better than pinning one language, at a small risk
+  of misdetecting very short chunks.
 
-1. Go to aistudio.google.com and sign in with any Google account.
-2. Click **Get API key** → **Create API key**.
-3. Copy it — it starts with `AIza...`. Save it somewhere temporarily (a notes
-   app), you'll paste it into the project in Step 6.
+## Known limitations / what I'd do differently with more time
 
-This is free — no billing, no card, unlike OpenAI's API.
+- Chunk-boundary word splitting (see above) — a raw PCM streaming approach via
+  `AudioWorklet` with server-side re-buffering would avoid this entirely but is
+  more complex to implement correctly.
+- Audio captured during a dropped connection, before reconnection completes,
+  is not recovered — it was never sent to the server before the drop.
+  Reconnection resumes new audio, not the gap itself.
+- No speaker diarization or timestamps (both bonus items, not implemented).
+- No export button for transcript/summary (bonus item, not implemented).
+- Using Whisper's "small" model is a reasonable accuracy/speed middle ground
+  on CPU — "medium" or "large" would improve accuracy further at the cost of
+  slower per-chunk transcription and a bigger download.
 
----
+## Sample output
 
-## STEP 3 — Unzip and open the project
-
-1. Unzip `speech-app.zip` somewhere convenient, e.g. `Downloads\speech-app`.
-2. In your terminal:
-   ```
-   cd Downloads\speech-app
-   ```
-3. Confirm you're in the right place:
-   ```
-   dir
-   ```
-   You should see `backend`, `frontend`, `README.md`.
-
----
-
-## STEP 4 — Set up the backend
-
-1. Move into the backend folder:
-   ```
-   cd backend
-   ```
-2. Create a virtual environment:
-   ```
-   python -m venv venv
-   ```
-3. Activate it:
-   ```
-   venv\Scripts\activate
-   ```
-   (Mac/Linux: `source venv/bin/activate`)
-   Your prompt should now start with `(venv)`. You must re-run this activate
-   command every time you open a new terminal for this project.
-4. Install the required packages:
-   ```
-   pip install -r requirements.txt --timeout 120
-   ```
-   This installs FastAPI, faster-whisper (local speech-to-text), and the
-   Gemini library. If it times out partway (common on slower/unstable
-   connections), just re-run the same command.
-
----
-
-## STEP 5 — Add your Gemini API key
-
-1. Still in the `backend` folder, copy the example env file:
-   ```
-   copy .env.example .env
-   ```
-2. Open it in Notepad:
-   ```
-   notepad .env
-   ```
-3. Make the file read exactly (your real key, no quotes, no spaces around
-   the `=`, all on one line):
-   ```
-   GEMINI_API_KEY=AIzaYourRealKeyHere
-   ```
-4. Save and close.
-5. Double check it saved correctly:
-   ```
-   type .env
-   ```
-   It should print your real key, not `your_key_here`.
-
-**Common mistake:** don't accidentally delete `GEMINI_API_KEY=` and leave
-only the key by itself — the app looks for that exact variable name.
-
----
-
-## STEP 6 — Run the backend server (first run downloads the Whisper model)
-
-1. Still in `backend`, with `(venv)` active:
-   ```
-   uvicorn server:app --reload --port 8000
-   ```
-2. The first time you run this, it automatically downloads the local Whisper
-   "tiny" speech-to-text model (~75MB) from Hugging Face. You'll see some
-   harmless warnings (about `google.generativeai` deprecation, symlinks on
-   Windows) — ignore those, they don't stop anything from working.
-3. **This download needs a stable connection.** If it seems stuck, open a
-   second terminal and check progress:
-   ```
-   dir %USERPROFILE%\.cache\huggingface\hub\models--Systran--faster-whisper-tiny\blobs
-   ```
-   Run it twice, 30 seconds apart — the file size should be growing. If it's
-   stuck at 0 bytes both times, your connection is dropping the download;
-   switching to a phone hotspot temporarily often fixes this.
-4. Once you see `INFO: Application startup complete.`, the server is ready
-   and running. Leave this terminal open — don't close it, don't type in it.
-   This model download only happens once; after that it's cached and works
-   offline.
-
----
-
-## STEP 7 — Run the frontend
-
-1. Open a **second, separate terminal** (leave the server one running).
-2. Navigate to the frontend folder:
-   ```
-   cd Downloads\speech-app\frontend
-   ```
-3. Start a simple local web server:
-   ```
-   python -m http.server 5500
-   ```
-4. Open Chrome and go to:
-   ```
-   http://localhost:5500
-   ```
-5. Allow microphone access when prompted. You should see "Microphone ready.
-   Click Start."
-
----
-
-## STEP 8 — Test it
-
-1. Click **Start Session**.
-2. Speak for 30-60 seconds, mixing Urdu/Hindi/Punjabi/English if you can —
-   that's what the assignment is actually testing.
-3. Text should start appearing in the Transcript box after the first 8-second
-   chunk finishes (there's a short delay, that's normal — local transcription
-   is slower than a cloud API).
-4. Click **End Session**. Wait a few seconds — the Summary box should fill in
-   with an English summary from Gemini.
-5. Watch the uvicorn terminal while you do this — errors, if any, print there.
-
-If transcript/summary stay empty, check that terminal for red text and send
-it to me exactly as printed.
-
----
-
-## STEP 9 — Git setup and commit history
-
-1. Confirm Git is installed:
-   ```
-   git --version
-   ```
-   Install from git-scm.com if missing.
-2. From the project root (`speech-app`, not `backend`):
-   ```
-   git init
-   ```
-3. Create `.gitignore` in the project root with:
-   ```
-   venv/
-   __pycache__/
-   .env
-   ```
-   This keeps your real Gemini key and the huge venv folder out of the repo.
-4. Commit in stages, not all at once:
-   ```
-   git add backend/requirements.txt backend/.env.example .gitignore
-   git commit -m "Set up backend project structure"
-
-   git add backend/server.py
-   git commit -m "Add WebSocket server with local Whisper transcription and Gemini summarization"
-
-   git add frontend/index.html
-   git commit -m "Add frontend with mic capture and live transcript display"
-
-   git add README.md
-   git commit -m "Add README with architecture and setup instructions"
-   ```
-5. Push to GitHub: create a new empty repo on github.com (don't add a README
-   there, you already have one), then:
-   ```
-   git remote add origin https://github.com/yourusername/your-repo-name.git
-   git branch -M main
-   git push -u origin main
-   ```
-
----
-
-## STEP 10 — Produce the required deliverables
-
-1. **Sample output:** run one real multilingual session end to end, copy the
-   transcript and summary text into the "Sample output" section at the
-   bottom of `README.md`. Commit that change.
-2. **Demo video (2-4 min):** screen-record (Win+G on Windows) showing: mic
-   permission → Start Session → you talking with a language switch → End
-   Session → transcript and summary appearing.
-3. **Check GitHub online** that `.env` is NOT visible in your repo. If it is,
-   run `git rm --cached backend/.env`, commit, and generate a new Gemini key
-   to replace the exposed one.
-
----
-
-## STEP 11 — Setting this up on a different device
-
-Anyone (including you, on another machine) does this from a fresh clone:
-```
-git clone https://github.com/yourusername/your-repo-name.git
-cd your-repo-name/backend
-python -m venv venv
-venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-```
-Then edit `.env` with their own Gemini key, run
-`uvicorn server:app --reload --port 8000`, and open `frontend/index.html`
-the same way. The Whisper model re-downloads automatically on that machine
-the first time — that's expected, it's not part of the Git repo.
-
----
-
-## STEP 12 — Submit
-
-Send Shah the GitHub repo link, confirm README, sample output, and demo
-video are all in place, before Monday, 10 August.
-
----
-
-## If something goes wrong
-
-Tell me the exact step number and paste the exact error text — copy it
-exactly, don't paraphrase.
+Add your real multilingual run's transcript and summary text here before
+submitting (required deliverable #3).
