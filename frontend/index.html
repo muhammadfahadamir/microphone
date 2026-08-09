@@ -1,138 +1,1337 @@
 <!DOCTYPE html>
-<html>
+<html lang="en">
+
 <head>
+
 <meta charset="UTF-8">
-<title>Speech Transcription & Summarization</title>
+
+<meta
+    name="viewport"
+    content="width=device-width, initial-scale=1.0"
+>
+
+<title>
+    Speech Transcription & Summarization
+</title>
+
 <style>
-  body { font-family: sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
-  #status { font-weight: bold; margin-bottom: 10px; }
-  button { padding: 10px 20px; font-size: 16px; margin-right: 10px; }
-  #transcript, #summary { border: 1px solid #ccc; padding: 12px; margin-top: 10px; min-height: 60px; white-space: pre-wrap; }
-  .dot { height: 12px; width: 12px; border-radius: 50%; display: inline-block; margin-right: 6px; }
-  .recording { background: red; }
-  .idle { background: gray; }
+
+body {
+    font-family: Arial, sans-serif;
+    max-width: 800px;
+    margin: 40px auto;
+    padding: 0 20px;
+}
+
+h2 {
+    margin-bottom: 20px;
+}
+
+#status {
+    font-weight: bold;
+    margin-bottom: 15px;
+}
+
+button {
+    padding: 10px 20px;
+    font-size: 16px;
+    margin-right: 10px;
+    cursor: pointer;
+}
+
+button:disabled {
+    cursor: not-allowed;
+    opacity: 0.6;
+}
+
+#transcript,
+#summary {
+    border: 1px solid #ccc;
+    padding: 15px;
+    margin-top: 10px;
+    min-height: 100px;
+    white-space: pre-wrap;
+    line-height: 1.5;
+}
+
+.dot {
+    height: 12px;
+    width: 12px;
+    border-radius: 50%;
+    display: inline-block;
+    margin-right: 6px;
+}
+
+.recording {
+    background: red;
+}
+
+.idle {
+    background: gray;
+}
+
+.processing {
+    background: orange;
+}
+
 </style>
+
 </head>
+
+
 <body>
-  <h2>Live Speech Transcription & Summary</h2>
-  <div id="status"><span class="dot idle" id="dot"></span><span id="statusText">Requesting microphone permission...</span></div>
-  <button id="startBtn" disabled>Start Session</button>
-  <button id="endBtn" disabled>End Session</button>
 
-  <h3>Transcript</h3>
-  <div id="transcript"></div>
+<h2>
+    Live Speech Transcription & Summary
+</h2>
 
-  <h3>Summary</h3>
-  <div id="summary"></div>
+
+<div id="status">
+
+    <span
+        class="dot idle"
+        id="dot"
+    ></span>
+
+    <span id="statusText">
+        Requesting microphone permission...
+    </span>
+
+</div>
+
+
+<button
+    id="startBtn"
+    disabled
+>
+    Start Session
+</button>
+
+
+<button
+    id="endBtn"
+    disabled
+>
+    End Session
+</button>
+
+
+<h3>
+    Transcript
+</h3>
+
+<div id="transcript"></div>
+
+
+<h3>
+    Summary
+</h3>
+
+<div id="summary"></div>
+
 
 <script>
+
+
+// ============================================================
+// CONFIGURATION
+// ============================================================
+
 const WS_URL = "ws://localhost:8000/ws";
-const CHUNK_MS = 8000; // restart the recorder every 8s so each chunk is a complete, decodable file
+
+// Manual / project target:
+// approximately 8-second complete audio chunks.
+const CHUNK_MS = 8000;
+
+// Keep the WebSocket alive while the user is silent.
+const HEARTBEAT_MS = 20000;
+
+// Reconnect delay.
+const RECONNECT_DELAY_MS = 1500;
+
+// Maximum reconnect attempts.
+const MAX_RECONNECT_ATTEMPTS = 10;
+
+
+// ============================================================
+// STATE
+// ============================================================
 
 let ws = null;
+
 let mediaStream = null;
+
 let mediaRecorder = null;
+
 let chunkTimer = null;
+
+let heartbeatTimer = null;
+
+let reconnectTimer = null;
+
+let reconnectAttempts = 0;
+
 let recording = false;
+
 let pendingEnd = false;
 
+let connecting = false;
+
+let reconnecting = false;
+
+
+// Complete transcript stored independently from the DOM.
+let fullTranscript = "";
+
+
+// Audio chunks that could not be sent because the WebSocket
+// temporarily disconnected.
+const pendingAudio = [];
+
+
+// ============================================================
+// DOM
+// ============================================================
+
 const dot = document.getElementById("dot");
-const statusText = document.getElementById("statusText");
-const startBtn = document.getElementById("startBtn");
-const endBtn = document.getElementById("endBtn");
-const transcriptDiv = document.getElementById("transcript");
-const summaryDiv = document.getElementById("summary");
+
+const statusText =
+    document.getElementById("statusText");
+
+const startBtn =
+    document.getElementById("startBtn");
+
+const endBtn =
+    document.getElementById("endBtn");
+
+const transcriptDiv =
+    document.getElementById("transcript");
+
+const summaryDiv =
+    document.getElementById("summary");
+
+
+// ============================================================
+// STATUS
+// ============================================================
+
+function setStatus(
+    text,
+    state = "idle"
+) {
+
+    statusText.textContent = text;
+
+    dot.className = "dot " + state;
+}
+
+
+// ============================================================
+// MICROPHONE
+// ============================================================
 
 async function requestMic() {
-  try {
-    mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-    statusText.textContent = "Microphone ready. Click Start.";
-    startBtn.disabled = false;
-  } catch (err) {
-    statusText.textContent = "Microphone permission denied. Enable it in browser settings and reload.";
-  }
+
+    setStatus(
+        "Requesting microphone permission...",
+        "idle"
+    );
+
+
+    try {
+
+        mediaStream =
+            await navigator.mediaDevices.getUserMedia({
+
+                audio: {
+
+                    // Browser-level noise filtering.
+                    noiseSuppression: true,
+
+                    // Reduce echo.
+                    echoCancellation: true,
+
+                    // Automatically normalize microphone level.
+                    autoGainControl: true
+
+                }
+
+            });
+
+
+        setStatus(
+            "Microphone ready. Click Start.",
+            "idle"
+        );
+
+
+        startBtn.disabled = false;
+
+
+    } catch (err) {
+
+        console.error(
+            "Microphone error:",
+            err
+        );
+
+
+        if (
+            err.name === "NotAllowedError"
+        ) {
+
+            setStatus(
+                "Microphone permission denied. Allow microphone access in browser settings and reload.",
+                "idle"
+            );
+
+        } else if (
+            err.name === "NotFoundError"
+        ) {
+
+            setStatus(
+                "No microphone was found.",
+                "idle"
+            );
+
+        } else {
+
+            setStatus(
+                "Microphone error: " +
+                err.message,
+                "idle"
+            );
+        }
+    }
 }
+
+
+// ============================================================
+// APPEND TRANSCRIPT
+// ============================================================
+
+function appendTranscript(text) {
+
+    if (!text) {
+        return;
+    }
+
+
+    text = text.trim();
+
+
+    if (!text) {
+        return;
+    }
+
+
+    fullTranscript +=
+        (fullTranscript ? " " : "") +
+        text;
+
+
+    transcriptDiv.textContent =
+        fullTranscript;
+}
+
+
+// ============================================================
+// SEND JSON
+// ============================================================
+
+function sendJson(data) {
+
+    if (
+        !ws ||
+        ws.readyState !== WebSocket.OPEN
+    ) {
+
+        return false;
+    }
+
+
+    try {
+
+        ws.send(
+            JSON.stringify(data)
+        );
+
+        return true;
+
+    } catch (err) {
+
+        console.error(
+            "WebSocket send error:",
+            err
+        );
+
+        return false;
+    }
+}
+
+
+// ============================================================
+// SEND BUFFERED AUDIO
+// ============================================================
+
+async function flushPendingAudio() {
+
+    while (
+        pendingAudio.length > 0 &&
+        ws &&
+        ws.readyState === WebSocket.OPEN
+    ) {
+
+        const blob =
+            pendingAudio.shift();
+
+
+        try {
+
+            const buffer =
+                await blob.arrayBuffer();
+
+
+            if (
+                !ws ||
+                ws.readyState !== WebSocket.OPEN
+            ) {
+
+                // Put it back if connection disappeared.
+                pendingAudio.unshift(blob);
+
+                return;
+            }
+
+
+            ws.send(buffer);
+
+
+        } catch (err) {
+
+            console.error(
+                "Failed to send buffered audio:",
+                err
+            );
+
+            pendingAudio.unshift(blob);
+
+            return;
+        }
+    }
+}
+
+
+// ============================================================
+// HEARTBEAT
+// ============================================================
+
+function startHeartbeat() {
+
+    stopHeartbeat();
+
+
+    heartbeatTimer = setInterval(() => {
+
+        if (
+            ws &&
+            ws.readyState === WebSocket.OPEN
+        ) {
+
+            sendJson({
+                type: "ping"
+            });
+
+        }
+
+    }, HEARTBEAT_MS);
+}
+
+
+function stopHeartbeat() {
+
+    if (heartbeatTimer) {
+
+        clearInterval(
+            heartbeatTimer
+        );
+
+        heartbeatTimer = null;
+    }
+}
+
+
+// ============================================================
+// CONNECT WEBSOCKET
+// ============================================================
 
 function connectWs() {
-  ws = new WebSocket(WS_URL);
-  ws.onmessage = (event) => {
-    const data = JSON.parse(event.data);
-    if (data.type === "partial") {
-      transcriptDiv.textContent += (transcriptDiv.textContent ? " " : "") + data.text;
-    } else if (data.type === "final") {
-      transcriptDiv.textContent = data.transcript;
-      summaryDiv.textContent = data.summary;
-      statusText.textContent = "Done.";
-    } else if (data.type === "error") {
-      console.error("Server error:", data.message);
-    }
-  };
-  ws.onclose = () => {
-    if (recording) {
-      statusText.textContent = "Connection lost, reconnecting...";
-      setTimeout(connectWs, 1000);
-    }
-  };
+
+    return new Promise(
+        (resolve, reject) => {
+
+            if (
+                ws &&
+                ws.readyState === WebSocket.OPEN
+            ) {
+
+                resolve();
+
+                return;
+            }
+
+
+            if (connecting) {
+
+                return;
+            }
+
+
+            connecting = true;
+
+
+            const socket =
+                new WebSocket(WS_URL);
+
+
+            ws = socket;
+
+
+            socket.onopen = async () => {
+
+                connecting = false;
+
+                reconnecting = false;
+
+                reconnectAttempts = 0;
+
+
+                console.log(
+                    "WebSocket connected."
+                );
+
+
+                startHeartbeat();
+
+
+                setStatus(
+                    recording
+                        ? "Recording..."
+                        : "Connected.",
+                    recording
+                        ? "recording"
+                        : "idle"
+                );
+
+
+                await flushPendingAudio();
+
+
+                resolve();
+            };
+
+
+            socket.onmessage = (
+                event
+            ) => {
+
+                try {
+
+                    const data =
+                        JSON.parse(
+                            event.data
+                        );
+
+
+                    // --------------------------------------------
+                    // PARTIAL TRANSCRIPTION
+                    // --------------------------------------------
+
+                    if (
+                        data.type === "partial"
+                    ) {
+
+                        appendTranscript(
+                            data.text
+                        );
+                    }
+
+
+                    // --------------------------------------------
+                    // HEARTBEAT RESPONSE
+                    // --------------------------------------------
+
+                    else if (
+                        data.type === "pong"
+                    ) {
+
+                        // Connection is alive.
+                        console.log(
+                            "WebSocket heartbeat OK."
+                        );
+                    }
+
+
+                    // --------------------------------------------
+                    // FINAL RESULT
+                    // --------------------------------------------
+
+                    else if (
+                        data.type === "final"
+                    ) {
+
+                        fullTranscript =
+                            data.transcript || "";
+
+
+                        transcriptDiv.textContent =
+                            fullTranscript;
+
+
+                        summaryDiv.textContent =
+                            data.summary || "";
+
+
+                        recording = false;
+
+                        pendingEnd = false;
+
+
+                        setStatus(
+                            "Done.",
+                            "idle"
+                        );
+
+
+                        startBtn.disabled = false;
+
+                        endBtn.disabled = true;
+
+
+                        stopHeartbeat();
+
+
+                        if (
+                            mediaStream
+                        ) {
+
+                            mediaStream
+                                .getTracks()
+                                .forEach(
+                                    track =>
+                                        track.stop()
+                                );
+
+                            mediaStream = null;
+                        }
+                    }
+
+
+                    // --------------------------------------------
+                    // ERROR
+                    // --------------------------------------------
+
+                    else if (
+                        data.type === "error"
+                    ) {
+
+                        console.error(
+                            "Server error:",
+                            data.message
+                        );
+                    }
+
+
+                } catch (err) {
+
+                    console.error(
+                        "Invalid WebSocket message:",
+                        err
+                    );
+                }
+            };
+
+
+            socket.onerror = (
+                event
+            ) => {
+
+                console.error(
+                    "WebSocket error:",
+                    event
+                );
+            };
+
+
+            socket.onclose = () => {
+
+                connecting = false;
+
+                stopHeartbeat();
+
+
+                console.log(
+                    "WebSocket closed."
+                );
+
+
+                if (
+                    ws === socket
+                ) {
+
+                    ws = null;
+                }
+
+
+                // --------------------------------------------
+                // If the user intentionally ended the session,
+                // don't reconnect.
+                // --------------------------------------------
+
+                if (
+                    !recording &&
+                    !pendingEnd
+                ) {
+
+                    return;
+                }
+
+
+                // --------------------------------------------
+                // If we're waiting for final summary,
+                // reconnect so the final message can still
+                // be delivered.
+                // --------------------------------------------
+
+                if (
+                    reconnectAttempts >=
+                    MAX_RECONNECT_ATTEMPTS
+                ) {
+
+                    setStatus(
+                        "Connection could not be restored.",
+                        "idle"
+                    );
+
+
+                    recording = false;
+
+                    pendingEnd = false;
+
+
+                    startBtn.disabled = false;
+
+                    endBtn.disabled = true;
+
+
+                    return;
+                }
+
+
+                reconnectAttempts++;
+
+                reconnecting = true;
+
+
+                setStatus(
+                    "Connection lost. Reconnecting...",
+                    "processing"
+                );
+
+
+                clearTimeout(
+                    reconnectTimer
+                );
+
+
+                reconnectTimer =
+                    setTimeout(
+                        async () => {
+
+                            try {
+
+                                await connectWs();
+
+
+                                if (
+                                    recording &&
+                                    !mediaRecorder
+                                ) {
+
+                                    recordOneChunk();
+                                }
+
+
+                                if (
+                                    pendingEnd &&
+                                    ws &&
+                                    ws.readyState ===
+                                        WebSocket.OPEN
+                                ) {
+
+                                    pendingEnd =
+                                        false;
+
+
+                                    sendJson({
+
+                                        type:
+                                            "end_session",
+
+                                        transcript:
+                                            fullTranscript
+                                    });
+                                }
+
+
+                            } catch (err) {
+
+                                console.error(
+                                    "Reconnect failed:",
+                                    err
+                                );
+                            }
+
+                        },
+                        RECONNECT_DELAY_MS
+                    );
+            };
+        }
+    );
 }
+
+
+// ============================================================
+// RECORD ONE 8-SECOND CHUNK
+// ============================================================
 
 function recordOneChunk() {
-  if (!recording) return;
-  const recorder = new MediaRecorder(mediaStream, { mimeType: "audio/webm;codecs=opus" });
-  const chunks = [];
-  recorder.ondataavailable = (e) => { if (e.data.size > 0) chunks.push(e.data); };
-  recorder.onstop = async () => {
-    const blob = new Blob(chunks, { type: "audio/webm" });
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      const buffer = await blob.arrayBuffer();
-      ws.send(buffer);
+
+    if (!recording) {
+        return;
     }
-    if (recording) {
-      recordOneChunk(); // start the next chunk immediately, no gap
-    } else if (pendingEnd) {
-      // Session was ended: this was the final chunk. Only now tell the
-      // server the session is over, so it isn't missing the last words.
-      pendingEnd = false;
-      if (ws && ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "end_session" }));
-      }
+
+
+    if (!mediaStream) {
+
+        console.error(
+            "No microphone stream."
+        );
+
+        return;
     }
-  };
-  mediaRecorder = recorder;
-  recorder.start();
-  chunkTimer = setTimeout(() => recorder.stop(), CHUNK_MS);
+
+
+    // Avoid accidentally creating two recorders.
+    if (
+        mediaRecorder &&
+        mediaRecorder.state !== "inactive"
+    ) {
+
+        return;
+    }
+
+
+    let options = {
+        mimeType:
+            "audio/webm;codecs=opus"
+    };
+
+
+    // Some browsers may not support the exact MIME type.
+    if (
+        !MediaRecorder.isTypeSupported(
+            options.mimeType
+        )
+    ) {
+
+        options = {};
+    }
+
+
+    const recorder =
+        new MediaRecorder(
+            mediaStream,
+            options
+        );
+
+
+    const chunks = [];
+
+
+    recorder.ondataavailable =
+        (event) => {
+
+            if (
+                event.data &&
+                event.data.size > 0
+            ) {
+
+                chunks.push(
+                    event.data
+                );
+            }
+        };
+
+
+    recorder.onerror =
+        (event) => {
+
+            console.error(
+                "MediaRecorder error:",
+                event
+            );
+        };
+
+
+    recorder.onstop =
+        async () => {
+
+            clearTimeout(
+                chunkTimer
+            );
+
+
+            mediaRecorder = null;
+
+
+            const blob =
+                new Blob(
+                    chunks,
+                    {
+                        type:
+                            "audio/webm"
+                    }
+                );
+
+
+            if (
+                blob.size > 0
+            ) {
+
+                // --------------------------------------------
+                // Send immediately if connected.
+                // Otherwise buffer it.
+                // --------------------------------------------
+
+                if (
+                    ws &&
+                    ws.readyState ===
+                        WebSocket.OPEN
+                ) {
+
+                    try {
+
+                        const buffer =
+                            await blob.arrayBuffer();
+
+
+                        if (
+                            ws &&
+                            ws.readyState ===
+                                WebSocket.OPEN
+                        ) {
+
+                            ws.send(
+                                buffer
+                            );
+
+                        } else {
+
+                            pendingAudio.push(
+                                blob
+                            );
+                        }
+
+                    } catch (err) {
+
+                        console.error(
+                            "Audio send error:",
+                            err
+                        );
+
+                        pendingAudio.push(
+                            blob
+                        );
+                    }
+
+                } else {
+
+                    pendingAudio.push(
+                        blob
+                    );
+                }
+            }
+
+
+            // --------------------------------------------
+            // Continue recording.
+            // --------------------------------------------
+
+            if (
+                recording
+            ) {
+
+                // Immediately start next chunk.
+                setTimeout(
+                    () => {
+
+                        if (
+                            recording
+                        ) {
+
+                            recordOneChunk();
+                        }
+
+                    },
+                    0
+                );
+
+
+                return;
+            }
+
+
+            // --------------------------------------------
+            // Recording has ended.
+            // Send remaining buffered audio first.
+            // --------------------------------------------
+
+            if (
+                pendingEnd
+            ) {
+
+                try {
+
+                    if (
+                        !ws ||
+                        ws.readyState !==
+                            WebSocket.OPEN
+                    ) {
+
+                        await connectWs();
+                    }
+
+
+                    await flushPendingAudio();
+
+
+                    if (
+                        ws &&
+                        ws.readyState ===
+                            WebSocket.OPEN
+                    ) {
+
+                        pendingEnd = false;
+
+
+                        setStatus(
+                            "Generating final summary...",
+                            "processing"
+                        );
+
+
+                        sendJson({
+
+                            type:
+                                "end_session",
+
+                            transcript:
+                                fullTranscript
+
+                        });
+
+                    }
+
+                } catch (err) {
+
+                    console.error(
+                        "Could not finish session:",
+                        err
+                    );
+
+
+                    pendingEnd = true;
+
+
+                    setStatus(
+                        "Waiting for connection to finish...",
+                        "processing"
+                    );
+                }
+            }
+        };
+
+
+    mediaRecorder =
+        recorder;
+
+
+    recorder.start();
+
+
+    chunkTimer =
+        setTimeout(
+            () => {
+
+                if (
+                    recorder.state !==
+                        "inactive"
+                ) {
+
+                    recorder.stop();
+                }
+
+            },
+            CHUNK_MS
+        );
 }
 
-startBtn.onclick = () => {
-  transcriptDiv.textContent = "";
-  summaryDiv.textContent = "";
-  recording = true;
-  dot.className = "dot recording";
-  statusText.textContent = "Recording...";
-  startBtn.disabled = true;
-  endBtn.disabled = false;
-  connectWs();
-  ws.onopen = () => recordOneChunk();
-};
 
-endBtn.onclick = () => {
-  recording = false;
-  pendingEnd = true;
-  dot.className = "dot idle";
-  statusText.textContent = "Processing final summary... (may take up to a minute)";
-  startBtn.disabled = false;
-  endBtn.disabled = true;
-  clearTimeout(chunkTimer);
-  if (mediaRecorder && mediaRecorder.state !== "inactive") {
-    mediaRecorder.stop(); // triggers onstop above, which sends the last
-                          // chunk and THEN sends end_session
-  } else if (ws && ws.readyState === WebSocket.OPEN) {
-    // No active recorder (shouldn't normally happen) — end immediately
-    pendingEnd = false;
-    ws.send(JSON.stringify({ type: "end_session" }));
-  }
-};
+// ============================================================
+// START SESSION
+// ============================================================
+
+startBtn.onclick =
+    async () => {
+
+        if (
+            recording
+        ) {
+
+            return;
+        }
+
+
+        if (
+            !mediaStream
+        ) {
+
+            await requestMic();
+
+
+            if (
+                !mediaStream
+            ) {
+
+                return;
+            }
+        }
+
+
+        // Reset session.
+        fullTranscript = "";
+
+        transcriptDiv.textContent = "";
+
+        summaryDiv.textContent = "";
+
+
+        recording = true;
+
+        pendingEnd = false;
+
+        reconnectAttempts = 0;
+
+
+        dot.className =
+            "dot recording";
+
+
+        statusText.textContent =
+            "Connecting...";
+
+
+        startBtn.disabled = true;
+
+        endBtn.disabled = false;
+
+
+        try {
+
+            await connectWs();
+
+
+            if (
+                !ws ||
+                ws.readyState !==
+                    WebSocket.OPEN
+            ) {
+
+                throw new Error(
+                    "WebSocket failed to open."
+                );
+            }
+
+
+            setStatus(
+                "Recording...",
+                "recording"
+            );
+
+
+            await flushPendingAudio();
+
+
+            recordOneChunk();
+
+
+        } catch (err) {
+
+            console.error(
+                "Could not start session:",
+                err
+            );
+
+
+            recording = false;
+
+
+            setStatus(
+                "Could not connect to server.",
+                "idle"
+            );
+
+
+            startBtn.disabled = false;
+
+            endBtn.disabled = true;
+        }
+    };
+
+
+// ============================================================
+// END SESSION
+// ============================================================
+
+endBtn.onclick =
+    () => {
+
+        if (
+            !recording
+        ) {
+
+            return;
+        }
+
+
+        recording = false;
+
+        pendingEnd = true;
+
+
+        setStatus(
+            "Finishing recording...",
+            "processing"
+        );
+
+
+        startBtn.disabled = true;
+
+        endBtn.disabled = true;
+
+
+        clearTimeout(
+            chunkTimer
+        );
+
+
+        // --------------------------------------------
+        // Stop current recorder.
+        //
+        // Its onstop handler will:
+        // 1. send the final audio
+        // 2. flush buffered audio
+        // 3. send end_session
+        // --------------------------------------------
+
+        if (
+            mediaRecorder &&
+            mediaRecorder.state !==
+                "inactive"
+        ) {
+
+            mediaRecorder.stop();
+
+        } else {
+
+            finishSession();
+        }
+    };
+
+
+// ============================================================
+// FINISH SESSION FALLBACK
+// ============================================================
+
+async function finishSession() {
+
+    try {
+
+        if (
+            !ws ||
+            ws.readyState !==
+                WebSocket.OPEN
+        ) {
+
+            await connectWs();
+        }
+
+
+        await flushPendingAudio();
+
+
+        if (
+            ws &&
+            ws.readyState ===
+                WebSocket.OPEN
+        ) {
+
+            pendingEnd = false;
+
+
+            setStatus(
+                "Generating final summary...",
+                "processing"
+            );
+
+
+            sendJson({
+
+                type:
+                    "end_session",
+
+                transcript:
+                    fullTranscript
+            });
+        }
+
+    } catch (err) {
+
+        console.error(
+            "Finish session error:",
+            err
+        );
+
+
+        pendingEnd = true;
+
+
+        setStatus(
+            "Connection lost. Trying to finish...",
+            "processing"
+        );
+    }
+}
+
+
+// ============================================================
+// INITIAL MICROPHONE REQUEST
+// ============================================================
 
 requestMic();
+
 </script>
+
 </body>
 </html>
